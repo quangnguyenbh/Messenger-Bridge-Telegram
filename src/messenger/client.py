@@ -1,20 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import base64
-import inspect
-import sys
+import contextlib
 import json
 import logging
-import threading
-import traceback
-from importlib import import_module
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+from fbchat_v2 import dataGetHome, listeningE2EEEvent
+from fbchat_v2._features._facebook._get_user_info import func as get_user_info
 
 from config import AppConfig
 from models import IncomingMessengerMessage, QuoteData, TopicEntry
 
 
-MessengerEventCallback = Callable[[dict], None]
+MessengerEventCallback = Callable[[dict[str, Any]], None]
 logger = logging.getLogger(__name__)
 
 
@@ -23,9 +23,9 @@ class MessengerClient:
         self.config = config
         self.data_fb: Optional[dict] = None
         self.self_id = ""
-        self.listener = None
-        self.e2ee_sender = None
-        self._thread: Optional[threading.Thread] = None
+        self.listener: Optional[listeningE2EEEvent] = None
+        self._listener_task: Optional[asyncio.Task[None]] = None
+        self._stopping = False
         self._last_error: Optional[BaseException] = None
         self._event_callback: Optional[MessengerEventCallback] = None
         self._user_name_cache: dict[str, str] = {}
@@ -37,57 +37,15 @@ class MessengerClient:
 
     @property
     def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._listener_task is not None and not self._listener_task.done()
 
-    def _prepare_fbchat_import(self) -> None:
-        if self.config.fbchat_v2_src_path is None:
-            logger.debug("FBCHAT_V2_SRC_PATH is not set; relying on installed fbchat-v2/Python import path")
-            return
-        if not self.config.fbchat_v2_src_path.exists():
-            raise RuntimeError(f"FBCHAT_V2_SRC_PATH does not exist: {self.config.fbchat_v2_src_path}")
-        core_file = self.config.fbchat_v2_src_path / "_core" / "_session.py"
-        e2ee_file = self.config.fbchat_v2_src_path / "_messaging" / "_listening_e2ee.py"
-        if not core_file.exists() or not e2ee_file.exists():
-            raise RuntimeError(
-                "FBCHAT_V2_SRC_PATH must point to the fbchat-v2/src folder "
-                f"that contains _core and _messaging, got: {self.config.fbchat_v2_src_path}"
-            )
-        path = str(self.config.fbchat_v2_src_path)
-        if path not in sys.path:
-            sys.path.insert(0, path)
-        logger.debug("Prepared fbchat-v2 import path: %s", path)
-
-    @staticmethod
-    def _import_fbchat_module(module_name: str):
-        root_name = module_name.split(".", 1)[0]
-        try:
-            return import_module(module_name)
-        except ModuleNotFoundError as top_level_exc:
-            if top_level_exc.name not in {root_name, module_name}:
-                raise
-            try:
-                return import_module(f"fbchat_v2.{module_name}")
-            except ModuleNotFoundError as namespaced_exc:
-                namespaced_root = f"fbchat_v2.{root_name}"
-                namespaced_name = f"fbchat_v2.{module_name}"
-                if namespaced_exc.name in {"fbchat_v2", namespaced_root, namespaced_name}:
-                    raise top_level_exc from namespaced_exc
-                raise
-
-    def login(self) -> None:
-        self._prepare_fbchat_import()
+    async def login(self) -> None:
         logger.info("Logging in to Messenger with fbchat-v2")
+        data_fb = await dataGetHome(self.config.facebook_cookie)
 
-        try:
-            data_get_home = self._import_fbchat_module("_core._session").dataGetHome
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "Could not import fbchat-v2 internal modules. Install fbchat-v2 from PyPI "
-                "or set FBCHAT_V2_SRC_PATH to the fbchat-v2/src folder. "
-                "For PyPI mode, set FBCHAT_V2_USE_PYPI=1 after installing requirements."
-            ) from exc
+        if not data_fb or not isinstance(data_fb, dict):
+            raise RuntimeError("Could not retrieve Facebook session data. Check FACEBOOK_COOKIE or network connection.")
 
-        data_fb = data_get_home(self.config.facebook_cookie)
         facebook_id = str(data_fb.get("FacebookID") or "")
         if not facebook_id or "Unable to retrieve" in facebook_id:
             raise RuntimeError("Could not read FacebookID from cookie. Refresh FACEBOOK_COOKIE.")
@@ -96,15 +54,16 @@ class MessengerClient:
         self.self_id = facebook_id
         logger.info("Messenger login complete: facebook_id=%s", self.self_id)
 
-    def start(self, event_callback: MessengerEventCallback) -> None:
+    async def start(self, event_callback: MessengerEventCallback) -> None:
+        if self.is_running:
+            raise RuntimeError("Messenger listener is already running")
         if self.data_fb is None:
-            self.login()
-
-        listening_e2ee_event = self._import_fbchat_module("_messaging._listening_e2ee").listeningE2EEEvent
-        e2ee_sender = self._import_fbchat_module("_messaging._send_e2ee").api
+            await self.login()
 
         self._event_callback = event_callback
-        self.listener = listening_e2ee_event(
+        self._last_error = None
+        self._stopping = False
+        self.listener = listeningE2EEEvent(
             self.data_fb,
             log_level=self.config.fbchat_e2ee_log_level,
             device_path=self.config.fbchat_e2ee_device_path,
@@ -113,7 +72,6 @@ class MessengerClient:
             binary_path=self.config.fbchat_e2ee_bin,
         )
         self.listener.on_message(event_callback)
-        self.e2ee_sender = e2ee_sender(listener=self.listener)
         logger.info(
             "Messenger listener configured: e2ee_enabled=%s memory_only=%s binary=%s",
             self.config.fbchat_enable_e2ee,
@@ -121,79 +79,101 @@ class MessengerClient:
             self.config.fbchat_e2ee_bin or "auto/default",
         )
 
-        self._thread = threading.Thread(
-            target=self._run_listener,
-            name="messenger-e2ee-listener",
-            daemon=True,
+        listener_task = asyncio.create_task(
+            self.listener.connect_mqtt(),
+            name="fbchat-v2-e2ee-listener",
         )
-        self._thread.start()
-
-    def _run_listener(self) -> None:
+        self._listener_task = listener_task
         try:
             logger.info("Messenger listener connecting MQTT")
-            self.listener.connect_mqtt()
-        except BaseException as exc:  # noqa: BLE001 - surface listener thread failures
-            self._last_error = exc
-            logger.exception("Messenger listener stopped with error")
-            traceback.print_exc()
-            if self._event_callback:
-                self._event_callback({
-                    "type": "error",
-                    "data": {"message": str(exc), "source": "listener"},
-                })
+            ready = await asyncio.to_thread(
+                self.listener.wait_until_connected,
+                self.config.fbchat_e2ee_ready_timeout,
+                require_e2ee=self.config.fbchat_enable_e2ee,
+            )
+            if not ready:
+                raise TimeoutError(
+                    "Messenger listener did not become ready within "
+                    f"{self.config.fbchat_e2ee_ready_timeout:g}s"
+                )
+        except BaseException:
+            await self.stop()
+            raise
 
-    def stop(self) -> None:
-        if self.listener is not None:
-            try:
-                logger.info("Stopping Messenger listener")
-                self.listener.stop()
-            except Exception:  # noqa: BLE001
-                pass
+        listener_task.add_done_callback(self._on_listener_done)
+        logger.info("Messenger listener is ready")
 
-    def resolve_user_name(self, user_id: str) -> Optional[str]:
+    def _on_listener_done(self, task: asyncio.Task[None]) -> None:
+        if self._stopping or self.listener is None or task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            error = RuntimeError("Messenger listener stopped unexpectedly")
+        self._last_error = error
+        logger.error(
+            "Messenger listener stopped with error",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        if self._event_callback:
+            self._event_callback({
+                "type": "error",
+                "data": {"message": str(error), "source": "listener"},
+            })
+
+    async def stop(self) -> None:
+        if self.listener is None and self._listener_task is None:
+            return
+        logger.info("Stopping Messenger listener")
+        self._stopping = True
+        try:
+            await self._stop_listener_task()
+        finally:
+            self.listener = None
+            self._listener_task = None
+            self._event_callback = None
+            self._stopping = False
+
+    async def _stop_listener_task(self) -> None:
+        listener = self.listener
+        listener_task = self._listener_task
+        if listener is not None:
+            await asyncio.to_thread(listener.stop)
+        if listener_task is None or listener_task is asyncio.current_task():
+            return
+
+        try:
+            await asyncio.wait_for(asyncio.shield(listener_task), timeout=5.0)
+        except asyncio.TimeoutError:
+            listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener_task
+        except asyncio.CancelledError:
+            if not listener_task.cancelled():
+                raise
+        except Exception:  # Listener errors are reported by start/done callbacks.
+            pass
+
+    async def resolve_user_name(self, user_id: str) -> Optional[str]:
         clean_id = str(user_id or "").strip()
         if not clean_id or self.data_fb is None:
             return None
         if clean_id in self._user_name_cache:
             return self._user_name_cache[clean_id]
 
-        info = self._request_user_info(clean_id)
-        if info is None:
+        try:
+            info = await get_user_info(self.data_fb, clean_id)
+        except Exception as exc:  # noqa: BLE001 - profile lookup is best effort
+            logger.debug("Could not resolve Messenger user name for %s: %s", clean_id, exc)
             return None
+        if not isinstance(info, dict) or info.get("error"):
+            logger.debug("Could not resolve Messenger user name for %s", clean_id)
+            return None
+
         name = str(info.get("nameUser") or info.get("firstName") or "").strip()
         if name:
             self._user_name_cache[clean_id] = name
             return name
         return None
-
-    def _request_user_info(self, user_id: str) -> Optional[dict]:
-        if self.data_fb is None:
-            return None
-
-        try:
-            requests = import_module("requests")
-            utils = self._import_fbchat_module("_core._utils")
-            data_form = utils.formAll(self.data_fb, requireGraphql=False)
-            data_form["ids[0]"] = user_id
-
-            response = requests.post(
-                "https://www.facebook.com/chat/user_info/",
-                headers=utils.Headers(data_form),
-                timeout=5,
-                data=data_form,
-                cookies=utils.parse_cookie_string(self.data_fb["cookieFacebook"]),
-                verify=True,
-            )
-            raw = response.text.split("for (;;);", 1)[-1]
-            profile = json.loads(raw)["payload"]["profiles"][str(user_id)]
-            return {
-                "idUser": profile.get("id"),
-                "nameUser": profile.get("name"),
-                "firstName": profile.get("firstName"),
-            }
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Could not resolve Messenger user name for %s: %s", user_id, exc)
-            return None
 
     def resolve_thread_name(self, thread_id: str) -> Optional[str]:
         clean_id = str(thread_id or "").strip()
@@ -267,7 +247,7 @@ class MessengerClient:
                 return actor_name
         return fallback_name
 
-    def resolve_topic_display_name(self, message: IncomingMessengerMessage) -> Optional[str]:
+    async def resolve_topic_display_name(self, message: IncomingMessengerMessage) -> Optional[str]:
         event_thread_name = str(message.thread_name or "").strip()
         if event_thread_name:
             self._thread_name_cache[message.thread_id] = event_thread_name
@@ -281,7 +261,7 @@ class MessengerClient:
             return self._group_fallback_name(message.thread_id or message.messenger_id)
 
         for candidate_id in self._candidate_profile_ids(message):
-            user_name = self.resolve_user_name(candidate_id)
+            user_name = await self.resolve_user_name(candidate_id)
             if user_name:
                 return user_name
         return None
@@ -332,7 +312,7 @@ class MessengerClient:
             return text
         return text.split("@", 1)[0]
 
-    def send_text(self, entry: TopicEntry, text: str, quote: Optional[QuoteData] = None) -> dict:
+    async def send_text(self, entry: TopicEntry, text: str, quote: Optional[QuoteData] = None) -> dict:
         if self.listener is None:
             raise RuntimeError("Messenger listener is not connected")
 
@@ -341,22 +321,20 @@ class MessengerClient:
             raise ValueError("Cannot send an empty Messenger message")
 
         if entry.transport == "e2ee":
-            if self.e2ee_sender is None:
-                raise RuntimeError("E2EE sender is not ready")
             reply_id, reply_sender = self._e2ee_reply_parts(quote)
             logger.info(
-                "Sending E2EE Messenger text: chat_jid=%s reply_id=%s timeout=%s text_len=%s",
+                "Sending E2EE Messenger text: chat_jid=%s reply_id=%s text_len=%s",
                 entry.chat_jid or entry.messenger_id,
                 reply_id or "-",
-                self.config.fbchat_e2ee_send_timeout,
                 len(content),
             )
-            return self._send_e2ee_text(
-                chat_jid=entry.chat_jid or entry.messenger_id,
-                content=content,
-                reply_id=reply_id,
-                reply_sender=reply_sender,
+            data = await self.listener.send_e2ee_message(
+                entry.chat_jid or entry.messenger_id,
+                content,
+                reply_to_id=reply_id,
+                reply_to_sender_jid=reply_sender,
             )
+            return self._normalize_send_result(data)
 
         reply_id = quote.message_id if quote and quote.transport == "regular" else ""
         logger.info(
@@ -365,50 +343,14 @@ class MessengerClient:
             reply_id or "-",
             len(content),
         )
-        data = self.listener.send_message(
+        data = await self.listener.send_message(
             int(entry.thread_id or entry.messenger_id),
             content,
             reply_to_id=reply_id,
         )
-        return {
-            "success": 1,
-            "payload": {
-                "messageID": data.get("messageId") or data.get("id"),
-                "timestamp": data.get("timestampMs") or data.get("timestamp") or 0,
-            },
-        }
+        return self._normalize_send_result(data)
 
-    def _send_e2ee_text(self, chat_jid: str, content: str, reply_id: str = "", reply_sender: str = "") -> dict:
-        if self.e2ee_sender is None:
-            raise RuntimeError("E2EE sender is not ready")
-
-        kwargs = {
-            "chat_jid": chat_jid,
-            "contentSend": content,
-            "replyMessage": reply_id,
-            "replySenderJid": reply_sender,
-        }
-        timeout = self.config.fbchat_e2ee_send_timeout
-        try:
-            parameters = inspect.signature(self.e2ee_sender.send).parameters
-        except (TypeError, ValueError):
-            parameters = {}
-
-        if "timeout" in parameters:
-            kwargs["timeout"] = timeout
-        else:
-            logger.debug("fbchat-v2 E2EE send() has no timeout parameter; calling without timeout")
-
-        try:
-            return self.e2ee_sender.send(**kwargs)
-        except TypeError as exc:
-            if "timeout" not in kwargs or "unexpected keyword argument 'timeout'" not in str(exc):
-                raise
-            kwargs.pop("timeout", None)
-            logger.warning("fbchat-v2 E2EE send() rejected timeout; retrying without timeout")
-            return self.e2ee_sender.send(**kwargs)
-
-    def send_telegram_sticker(
+    async def send_telegram_sticker(
         self,
         entry: TopicEntry,
         file_data: bytes,
@@ -439,7 +381,7 @@ class MessengerClient:
                 reply_id or "-",
             )
             if clean_mime == "image/webp" or clean_filename.lower().endswith(".webp"):
-                return self._call_bridge_send("sendE2EESticker", {
+                return await self._call_bridge_send("sendE2EESticker", {
                     "chatJid": chat_jid,
                     "data": encoded,
                     "mimeType": clean_mime or "image/webp",
@@ -449,7 +391,7 @@ class MessengerClient:
                     "replyToSenderJid": reply_sender,
                 })
             if clean_mime.startswith("video/"):
-                return self._call_bridge_send("sendE2EEVideo", {
+                return await self._call_bridge_send("sendE2EEVideo", {
                     "chatJid": chat_jid,
                     "data": encoded,
                     "mimeType": clean_mime,
@@ -459,7 +401,7 @@ class MessengerClient:
                     "replyToId": reply_id,
                     "replyToSenderJid": reply_sender,
                 })
-            return self._call_bridge_send("sendE2EEDocument", {
+            return await self._call_bridge_send("sendE2EEDocument", {
                 "chatJid": chat_jid,
                 "data": encoded,
                 "filename": clean_filename,
@@ -479,14 +421,14 @@ class MessengerClient:
             reply_id or "-",
         )
         if clean_mime.startswith("image/"):
-            return self._call_bridge_send("sendImage", {
+            return await self._call_bridge_send("sendImage", {
                 "threadId": thread_id,
                 "data": encoded,
                 "filename": clean_filename,
                 "caption": "",
                 "replyToId": reply_id,
             })
-        return self._call_bridge_send("sendFile", {
+        return await self._call_bridge_send("sendFile", {
             "threadId": thread_id,
             "data": encoded,
             "filename": clean_filename,
@@ -495,7 +437,7 @@ class MessengerClient:
             "replyToId": reply_id,
         })
 
-    def send_reaction(self, quote: QuoteData, emoji: str) -> dict:
+    async def send_reaction(self, quote: QuoteData, emoji: str) -> dict:
         if self.listener is None:
             raise RuntimeError("Messenger listener is not connected")
         if not quote.message_id:
@@ -516,7 +458,7 @@ class MessengerClient:
                 sender_jid,
                 clean_emoji or "<remove>",
             )
-            return self._call_bridge_send("sendE2EEReaction", {
+            return await self._call_bridge_send("sendE2EEReaction", {
                 "chatJid": chat_jid,
                 "messageId": message_id,
                 "senderJid": sender_jid,
@@ -530,19 +472,19 @@ class MessengerClient:
             quote.message_id,
             clean_emoji or "<remove>",
         )
-        return self._call_bridge_send("sendReaction", {
+        return await self._call_bridge_send("sendReaction", {
             "threadId": thread_id,
             "messageId": quote.message_id,
             "emoji": clean_emoji,
         })
 
-    def _call_bridge_send(self, method: str, params: dict) -> dict:
+    async def _call_bridge_send(self, method: str, params: dict) -> dict:
         bridge = getattr(self.listener, "_bridge", None)
         if bridge is None:
             raise RuntimeError("Messenger bridge RPC is not connected")
         timeout = self.config.fbchat_e2ee_send_timeout if method.startswith("sendE2EE") else 60.0
         logger.debug("Calling Messenger bridge RPC: method=%s timeout=%s", method, timeout)
-        data = bridge.call(method, params, timeout=timeout)
+        data = await bridge.call(method, params, timeout=timeout)
         return self._normalize_send_result(data)
 
     def _e2ee_reply_parts(self, quote: Optional[QuoteData]) -> tuple[str, str]:

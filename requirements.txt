@@ -1,4 +1,4 @@
-fbchat-v2>=2.0.0
+fbchat-v2>=2.3.0,<2.4.0
 python-telegram-bot>=21.7
 python-dotenv>=1.0.1
 requests>=2.31.0

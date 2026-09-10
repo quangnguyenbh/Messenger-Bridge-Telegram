@@ -49,8 +49,8 @@ Facebook Messenger
 | File | Vai trò |
 |---|---|
 | `src/main.py` | Entry point, load config, logging và Telegram polling. |
-| `src/config.py` | Đọc `.env`, chọn nguồn `fbchat-v2`, tìm E2EE binary. |
-| `src/messenger/client.py` | Đăng nhập Messenger, import `fbchat-v2`, gửi text/reaction/sticker/media. |
+| `src/config.py` | Đọc `.env` và cấu hình package/binary E2EE. |
+| `src/messenger/client.py` | Quản lý async lifecycle của `fbchat-v2`, gửi text/reaction/sticker/media. |
 | `src/messenger/events.py` | Chuẩn hoá raw event Messenger thành model nội bộ. |
 | `src/bridge.py` | Điều phối hai chiều, topic mapping, recovery, retry, upload ảnh, activity. |
 | `src/store.py` | Lưu topic/message/quote mapping vào JSON. |
@@ -65,9 +65,8 @@ Facebook Messenger
 - Telegram supergroup đã bật Topics.
 - Bot Telegram là admin và có quyền Manage Topics, gửi tin nhắn, gửi media.
 - Cookie Facebook của tài khoản Messenger dùng để bridge.
-- `fbchat-v2` cài trực tiếp từ GitHub repo.
-- Go 1.24 trở lên nếu cần build E2EE binary.
-- Git để cài `fbchat-v2` từ GitHub và clone source khi build E2EE.
+- `fbchat-v2` 2.3.x được cài từ PyPI.
+- Kết nối Internet ở lần chạy E2EE đầu tiên để package tải binary đúng phiên bản trên nền tảng được hỗ trợ.
 
 ## Cài đặt nhanh
 
@@ -91,39 +90,25 @@ FACEBOOK_COOKIE=c_user=...; xs=...; fr=...; datr=...;
 DATA_DIR=./data
 ```
 
-Sau đó cài `fbchat-v2` trực tiếp từ GitHub repo ở phần tiếp theo để lấy code mới nhất.
+`requirements.txt` đã cài luôn `fbchat-v2` 2.3.x; không cần clone hay thêm source local vào `PYTHONPATH`.
 
 ## Cài fbchat-v2
 
-Bridge dùng `fbchat-v2` được cài trực tiếp từ GitHub repo vào Python environment.
-
-### Cài trực tiếp từ GitHub repo
-
-Cách này cài `fbchat-v2` vào Python environment bằng link repository. Phù hợp khi muốn dùng source mới nhất từ GitHub mà không cần giữ folder source local cạnh project.
+Bridge chỉ dùng package [`fbchat-v2` phát hành trên PyPI](https://pypi.org/project/fbchat-v2/) từ [repository chính thức](https://github.com/m008v/fbchat-v2). Version được giới hạn trong nhánh `2.3.x` để tránh tự nuốt breaking change của minor tiếp theo.
 
 ```powershell
 cd ...
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade "git+https://github.com/MinhHuyDev/fbchat-v2.git"
+python -m pip install --upgrade -r requirements.txt
 ```
 
-Nếu cần pin branch hoặc commit:
+Kiểm tra version và đường dẫn import:
 
 ```powershell
-python -m pip install --upgrade "git+https://github.com/MinhHuyDev/fbchat-v2.git@main"
+python -c "import fbchat_v2; print(fbchat_v2.__version__); print(fbchat_v2.__file__)"
 ```
 
-Trong `.env`:
-
-```env
-FBCHAT_V2_USE_PACKAGE=1
-```
-
-Kiểm tra version/package:
-
-```powershell
-python -m pip show fbchat-v2
-```
+Đường dẫn phải nằm trong `site-packages/fbchat_v2`, không được trỏ sang folder `fbchat-v2/src` cạnh repository này.
 
 ## Cài E2EE bridge
 
@@ -132,75 +117,22 @@ E2EE có hai phần:
 - Python wrapper nằm trong `fbchat-v2`.
 - Go binary `fbchat-bridge-e2ee.exe` xử lý Messenger E2EE, chạy như subprocess qua JSON-RPC.
 
-Package cài từ GitHub cung cấp Python module, nhưng không phải lúc nào cũng kèm binary Go. Nếu `FBCHAT_ENABLE_E2EE=1`, bạn nên tự build hoặc trỏ tới binary đã build sẵn bằng `FBCHAT_E2EE_BIN`.
+`fbchat-v2` 2.3.x tự tải asset release phù hợp cho Windows x64, Linux x64/ARM64 và macOS x64/ARM64, rồi kiểm tra version, kích thước và SHA-256 trước khi chạy. Vì vậy cấu hình mặc định không cần source Go, Git hay `FBCHAT_E2EE_BIN`.
 
-### 1. Cài Go
-
-Cài Go 1.24 trở lên từ:
-
-```text
-https://go.dev/dl/
-```
-
-Kiểm tra:
-
-```powershell
-go version
-```
-
-### 2. Clone fbchat-v2 để build binary
-
-Nếu bạn đã có folder `fbchat-v2` cạnh project thì bỏ qua bước clone.
-
-```powershell
-cd "c:\Users\minhh\Downloads\mhwidev - project"
-git clone https://github.com/MinhHuyDev/fbchat-v2.git fbchat-v2
-```
-
-### 3. Build trên Windows
-
-```powershell
-cd "c:\Users\minhh\Downloads\mhwidev - project\fbchat-v2\bridge-e2ee"
-if (!(Test-Path .\meta)) { git clone https://github.com/mautrix/meta.git .\meta }
-go mod tidy
-go build -ldflags="-s -w" -o ..\build\fbchat-bridge-e2ee.exe .
-```
-
-Binary sau build:
-
-```text
-fbchat-v2/build/fbchat-bridge-e2ee.exe
-```
-
-### 4. Build trên Linux/macOS
-
-```bash
-cd /path/to/fbchat-v2/bridge-e2ee
-test -d ./meta || git clone https://github.com/mautrix/meta.git ./meta
-go mod tidy
-go build -ldflags="-s -w" -o ../build/fbchat-bridge-e2ee .
-```
-
-### 5. Cấu hình E2EE trong `.env`
-
-Windows:
+Cấu hình E2EE trong `.env`:
 
 ```env
 FBCHAT_ENABLE_E2EE=1
-FBCHAT_E2EE_BIN=../fbchat-v2/build/fbchat-bridge-e2ee.exe
 FBCHAT_E2EE_MEMORY_ONLY=1
 FBCHAT_E2EE_LOG_LEVEL=none
+FBCHAT_E2EE_READY_TIMEOUT=90
 FBCHAT_E2EE_SEND_TIMEOUT=180
 ```
 
-Linux/macOS:
+Chỉ đặt `FBCHAT_E2EE_BIN` khi chủ động quản lý một binary tương thích đúng protocol của package:
 
 ```env
-FBCHAT_ENABLE_E2EE=1
-FBCHAT_E2EE_BIN=../fbchat-v2/build/fbchat-bridge-e2ee
-FBCHAT_E2EE_MEMORY_ONLY=1
-FBCHAT_E2EE_LOG_LEVEL=none
-FBCHAT_E2EE_SEND_TIMEOUT=180
+FBCHAT_E2EE_BIN=C:/path/to/fbchat-bridge-e2ee.exe
 ```
 
 Nếu muốn lưu device/key E2EE xuống file thay vì chỉ giữ trong RAM:
@@ -216,22 +148,6 @@ Nếu chỉ cần Messenger regular và muốn tắt E2EE:
 FBCHAT_ENABLE_E2EE=0
 ```
 
-### 6. Kiểm tra binary E2EE
-
-Từ thư mục `fbchat-v2/bridge-e2ee`:
-
-```powershell
-'{"id":1,"method":"isConnected","params":{}}' | & "..\build\fbchat-bridge-e2ee.exe"
-```
-
-Kết quả hợp lệ khi chưa login sẽ có dạng:
-
-```json
-{"id":1,"ok":true,"data":{"connected":false,"e2eeConnected":false}}
-```
-
-Nếu nhận `unknown method`, binary quá cũ hoặc build sai source. Nếu báo không tìm thấy file, kiểm tra lại `FBCHAT_E2EE_BIN`.
-
 ## Cấu hình
 
 `.env` được đọc từ thư mục `Messenger-Bridge-Telegram`. Không commit file này vì chứa token, cookie và có thể chứa key E2EE.
@@ -244,14 +160,13 @@ Nếu nhận `unknown method`, binary quá cũ hoặc build sai source. Nếu b�
 | `FACEBOOK_COOKIE_FILE` | Có* | - | File chứa cookie, dùng thay cho `FACEBOOK_COOKIE`. |
 | `LOG_LEVEL` | Không | `DEBUG` | Log terminal. Dùng `INFO` nếu muốn gọn hơn. |
 | `DATA_DIR` | Không | `./data` | Nơi lưu `bridge-store.json`. |
-| `FBCHAT_V2_USE_PACKAGE` | Không | `0` | Dùng package `fbchat-v2` đã cài từ GitHub thay vì auto-detect source local. |
-| `FBCHAT_V2_SRC_PATH` | Không | auto-detect | Tuỳ chọn nâng cao: trỏ tới `fbchat-v2/src` nếu cần override source local. |
-| `FBCHAT_E2EE_BIN` | Không | auto-detect local | Đường dẫn tới `fbchat-bridge-e2ee[.exe]`. Nên set rõ khi dùng package GitHub. |
+| `FBCHAT_E2EE_BIN` | Không | package tự quản lý | Đường dẫn override tới binary tương thích; thường nên để trống. |
 | `FBCHAT_ENABLE_E2EE` | Không | `1` | Bật/tắt listener/send E2EE. |
 | `FBCHAT_E2EE_MEMORY_ONLY` | Không | `1` | Giữ device/key E2EE trong RAM. |
 | `FBCHAT_E2EE_DEVICE_PATH` | Không | - | File lưu device/key khi `FBCHAT_E2EE_MEMORY_ONLY=0`. |
 | `FBCHAT_E2EE_LOG_LEVEL` | Không | `none` | Log level của E2EE bridge. |
-| `FBCHAT_E2EE_SEND_TIMEOUT` | Không | `180` | Timeout gửi E2EE qua RPC, tính bằng giây. |
+| `FBCHAT_E2EE_READY_TIMEOUT` | Không | `90` | Thời gian chờ listener và E2EE handshake sẵn sàng khi khởi động. |
+| `FBCHAT_E2EE_SEND_TIMEOUT` | Không | `180` | Timeout cho RPC E2EE media/reaction, tính bằng giây. |
 | `IGNORE_SELF_MESSAGES` | Không | `1` | Bỏ qua tin do chính tài khoản Facebook bridge gửi. |
 | `MESSAGE_CACHE_LIMIT` | Không | `3000` | Số mapping message giữ lại để reply/reaction/activity. |
 | `TG_CONNECT_TIMEOUT` | Không | `15` | Timeout kết nối Telegram Bot API. |
@@ -360,7 +275,7 @@ Không nên xoá file này khi bridge đang chạy. Nếu xoá, bot vẫn chạy
 - Telegram topic ID có thể stale nếu topic bị xoá/đóng; bridge có cơ chế tạo topic mới và retry.
 - Typing/read receipt có tần suất cao. Chỉ bật khi thật sự cần realtime status.
 - Read receipt tự xoá sau 5 giây. Typing tự xoá khi ngưng nhập, có tin nhắn mới hoặc hết TTL.
-- Nếu dùng package GitHub, vẫn nên set `FBCHAT_E2EE_BIN` rõ ràng khi bật E2EE.
+- Chỉ set `FBCHAT_E2EE_BIN` khi có binary tương thích đã được quản lý riêng; mặc định nên để package tự chọn.
 - Sau khi đổi `.env`, luôn restart bot để config mới có hiệu lực.
 
 ## Troubleshooting
@@ -377,34 +292,26 @@ Kiểm tra `.env` đã tồn tại trong thư mục `Messenger-Bridge-Telegram` 
 
 Chạy `/checktopics`. Group phải là supergroup, đã bật Topics, bot phải là admin và có quyền Manage Topics.
 
-### `Could not import fbchat-v2 internal modules`
+### `ModuleNotFoundError: No module named 'fbchat_v2'`
 
-Nếu cài từ GitHub:
+Đảm bảo đang dùng đúng virtual environment rồi cài dependency từ PyPI:
 
 ```powershell
-python -m pip install --upgrade "git+https://github.com/MinhHuyDev/fbchat-v2.git"
-```
-
-Trong `.env`:
-
-```env
-FBCHAT_V2_USE_PACKAGE=1
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade -r requirements.txt
+python -c "import fbchat_v2; print(fbchat_v2.__version__); print(fbchat_v2.__file__)"
 ```
 
 ### Không tìm thấy `fbchat-bridge-e2ee.exe`
 
-Build binary theo mục [Cài E2EE bridge](#cài-e2ee-bridge), sau đó set:
-
-```env
-FBCHAT_E2EE_BIN=../fbchat-v2/build/fbchat-bridge-e2ee.exe
-```
+Để trống `FBCHAT_E2EE_BIN` và kiểm tra máy có thể tải GitHub Release asset. Package 2.3.x sẽ tự chọn, tải và xác minh binary. Nếu đang đặt override thủ công, bỏ giá trị cũ hoặc thay bằng binary tương thích đúng version.
 
 ### E2EE không nhận/gửi được tin
 
 - Kiểm tra `FBCHAT_ENABLE_E2EE=1`.
-- Kiểm tra `FBCHAT_E2EE_BIN` trỏ đúng binary mới build.
-- Chạy smoke test `isConnected` ở mục E2EE.
-- Nếu mới đổi source/binary, restart bot.
+- Để `FBCHAT_E2EE_BIN` trống, trừ khi đang chủ động quản lý binary tương thích.
+- Kiểm tra mạng có truy cập được GitHub Release ở lần tải đầu.
+- Nếu vừa nâng package/binary, restart bot.
 - Nếu vẫn timeout, tăng `FBCHAT_E2EE_SEND_TIMEOUT` hoặc restart để tạo lại bridge process.
 
 ### Topic hiện ID hoặc tên người gửi thay vì tên nhóm
@@ -466,17 +373,10 @@ cd ...
 python -m compileall src
 ```
 
-Kiểm tra import package GitHub:
+Kiểm tra package PyPI và async contract:
 
 ```powershell
-python -c "from importlib import import_module; print(import_module('fbchat_v2._messaging._listening_e2ee').__file__)"
-```
-
-Kiểm tra E2EE binary:
-
-```powershell
-cd "c:\Users\minhh\Downloads\mhwidev - project\fbchat-v2\bridge-e2ee"
-'{"id":1,"method":"isConnected","params":{}}' | & "..\build\fbchat-bridge-e2ee.exe"
+python -c "import inspect, fbchat_v2; from fbchat_v2 import dataGetHome, listeningE2EEEvent; print(fbchat_v2.__version__, fbchat_v2.__file__); assert inspect.iscoroutinefunction(dataGetHome); assert inspect.iscoroutinefunction(listeningE2EEEvent.connect_mqtt)"
 ```
 
 ## Giới hạn hiện tại

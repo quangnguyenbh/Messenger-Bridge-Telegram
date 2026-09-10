@@ -47,36 +47,6 @@ def _resolve_path(value: Optional[str], default_relative: str) -> Path:
     return (PROJECT_ROOT / path).resolve()
 
 
-def _looks_like_fbchat_src(path: Path) -> bool:
-    return (path / "_core" / "_session.py").exists() and (path / "_messaging" / "_listening_e2ee.py").exists()
-
-
-def _default_fbchat_src_path() -> Optional[Path]:
-    candidates = [
-        PROJECT_ROOT.parent / "fbchat-v2" / "src",
-        PROJECT_ROOT.parent / "fbchat-v2-pypi" / "src",
-        PROJECT_ROOT.parent / "fbchat-v2 (1.x)" / "src",
-    ]
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if _looks_like_fbchat_src(resolved):
-            return resolved
-    return None
-
-
-def _default_e2ee_binary() -> Optional[str]:
-    binary_name = "fbchat-bridge-e2ee.exe" if os.name == "nt" else "fbchat-bridge-e2ee"
-    candidates = [
-        PROJECT_ROOT.parent / "fbchat-v2" / "build" / binary_name,
-        PROJECT_ROOT.parent / "fbchat-v2-pypi" / "build" / binary_name,
-    ]
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved.exists():
-            return str(resolved)
-    return None
-
-
 def _read_cookie() -> str:
     direct = os.environ.get("FACEBOOK_COOKIE") or os.environ.get("MESSENGER_COOKIE")
     if direct and direct.strip():
@@ -100,12 +70,12 @@ class AppConfig:
     facebook_cookie: str
     data_dir: Path
     store_path: Path
-    fbchat_v2_src_path: Optional[Path]
     fbchat_e2ee_bin: Optional[str]
     fbchat_e2ee_device_path: Optional[str]
     fbchat_e2ee_log_level: str
     fbchat_e2ee_memory_only: bool
     fbchat_enable_e2ee: bool
+    fbchat_e2ee_ready_timeout: float
     fbchat_e2ee_send_timeout: float
     ignore_self_messages: bool
     message_cache_limit: int
@@ -122,13 +92,7 @@ def load_config() -> AppConfig:
     _load_dotenv()
 
     data_dir = _resolve_path(os.environ.get("DATA_DIR"), "data")
-    use_installed_fbchat = _env_bool("FBCHAT_V2_USE_PACKAGE", _env_bool("FBCHAT_V2_USE_PYPI", False))
-    fbchat_src_raw = os.environ.get("FBCHAT_V2_SRC_PATH", "").strip()
-    if use_installed_fbchat:
-        fbchat_src = None
-    else:
-        fbchat_src = _resolve_path(fbchat_src_raw, fbchat_src_raw) if fbchat_src_raw else _default_fbchat_src_path()
-    e2ee_bin = os.environ.get("FBCHAT_E2EE_BIN") or _default_e2ee_binary()
+    e2ee_bin = os.environ.get("FBCHAT_E2EE_BIN", "").strip() or None
 
     return AppConfig(
         log_level=os.environ.get("LOG_LEVEL", "DEBUG").strip().upper() or "DEBUG",
@@ -137,12 +101,12 @@ def load_config() -> AppConfig:
         facebook_cookie=_read_cookie(),
         data_dir=data_dir,
         store_path=data_dir / "bridge-store.json",
-        fbchat_v2_src_path=fbchat_src,
         fbchat_e2ee_bin=e2ee_bin,
         fbchat_e2ee_device_path=os.environ.get("FBCHAT_E2EE_DEVICE_PATH") or None,
         fbchat_e2ee_log_level=os.environ.get("FBCHAT_E2EE_LOG_LEVEL", "none"),
         fbchat_e2ee_memory_only=_env_bool("FBCHAT_E2EE_MEMORY_ONLY", True),
         fbchat_enable_e2ee=_env_bool("FBCHAT_ENABLE_E2EE", True),
+        fbchat_e2ee_ready_timeout=float(os.environ.get("FBCHAT_E2EE_READY_TIMEOUT", "90")),
         fbchat_e2ee_send_timeout=float(os.environ.get("FBCHAT_E2EE_SEND_TIMEOUT", "180")),
         ignore_self_messages=_env_bool("IGNORE_SELF_MESSAGES", True),
         message_cache_limit=_env_int("MESSAGE_CACHE_LIMIT", 3000),

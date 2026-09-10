@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 venv/
 facebook-cookie.txt
+/AGENT_MEMORYs.md

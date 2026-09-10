@@ -85,10 +85,10 @@ class MessengerTelegramBridge:
             ("help", "Show bridge help"),
         ])
 
-        await asyncio.to_thread(self.messenger.login)
+        await self.messenger.login()
         logger.info("Messenger login OK: facebook_id=%s", self.messenger.self_id or "-")
-        self.messenger.start(self._on_messenger_event_from_thread)
-        logger.info("Messenger listener thread started")
+        await self.messenger.start(self._on_messenger_event_from_thread)
+        logger.info("Messenger listener started")
         await self._notify_general(
             "Messenger bridge started. Waiting for E2EE and regular Messenger events."
         )
@@ -99,7 +99,7 @@ class MessengerTelegramBridge:
             task.cancel()
         self._ephemeral_delete_tasks.clear()
         self._typing_messages.clear()
-        self.messenger.stop()
+        await self.messenger.stop()
 
     def _on_messenger_event_from_thread(self, event: dict) -> None:
         if self.loop is None:
@@ -423,7 +423,7 @@ class MessengerTelegramBridge:
             return
         if message.sender_name and message.sender_name != message.sender_id:
             return
-        resolved = await asyncio.to_thread(self.messenger.resolve_user_name, message.sender_id)
+        resolved = await self.messenger.resolve_user_name(message.sender_id)
         if resolved:
             message.sender_name = resolved
 
@@ -432,7 +432,7 @@ class MessengerTelegramBridge:
             return
         if activity.actor_name and activity.actor_name != activity.actor_id:
             return
-        resolved = await asyncio.to_thread(self.messenger.resolve_user_name, activity.actor_id)
+        resolved = await self.messenger.resolve_user_name(activity.actor_id)
         if resolved:
             activity.actor_name = resolved
 
@@ -536,7 +536,7 @@ class MessengerTelegramBridge:
         return True
 
     async def _resolve_topic_display_name(self, message: IncomingMessengerMessage) -> str:
-        resolved = await asyncio.to_thread(self.messenger.resolve_topic_display_name, message)
+        resolved = await self.messenger.resolve_topic_display_name(message)
         return resolved or message.sender_name or message.messenger_id
 
     async def _maybe_rename_existing_topic(self, entry: TopicEntry, message: IncomingMessengerMessage) -> None:
@@ -1052,7 +1052,7 @@ class MessengerTelegramBridge:
             _preview(text),
         )
         try:
-            result = await asyncio.to_thread(self.messenger.send_text, entry, text, quote)
+            result = await self.messenger.send_text(entry, text, quote)
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "Telegram -> Messenger failed: topic_id=%s tg_message_id=%s transport=%s messenger_id=%s thread_id=%s",
@@ -1153,7 +1153,7 @@ class MessengerTelegramBridge:
             quote.message_id,
         )
         try:
-            result = await asyncio.to_thread(self.messenger.send_reaction, quote, new_emoji)
+            result = await self.messenger.send_reaction(quote, new_emoji)
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "Telegram -> Messenger reaction failed: tg_message_id=%s transport=%s messenger_id=%s messenger_message_id=%s",
@@ -1225,8 +1225,7 @@ class MessengerTelegramBridge:
         try:
             telegram_file = await self._telegram_call(self.bot.get_file, sticker.file_id)
             file_data = bytes(await telegram_file.download_as_bytearray())
-            result = await asyncio.to_thread(
-                self.messenger.send_telegram_sticker,
+            result = await self.messenger.send_telegram_sticker(
                 entry,
                 file_data,
                 filename,
